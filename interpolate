@@ -1,0 +1,340 @@
+#!/bin/bash
+
+#
+# Interpolate a text file, replacing tokens of the
+# form ${TOKEN_NAME} with the equivalent environment
+# variable
+#
+# Author: Bert van Brakel 2015
+#
+
+
+OPTIND=1
+
+_progname=`basename "$0"`
+_fail_on_missing=1
+
+_recursive=0
+_extension="template"
+_output_file=""
+_dummy_run=0
+_verbose=0
+_expand_vars=0
+
+# inputs
+_template_src=""
+_template_path=""
+_scan_directory=""
+
+
+usage() {
+    cat <<EOF
+Usage: $_progname [OPTIONS] -t|-i|-d|SRC_TEXT
+Description:
+   Parse a text stream and replace any tokens with the value of the matching environment variable. Tokens 
+   are of the form \${TOKEN_NAME}, where spaces around the token name are ignored
+
+   Reads from stdin and outputs to stdout unless the file in and/or out arguments are provided
+
+   By default fails if tokens exist with no matching environment variables 
+
+   The environment variables are set and overridden in the order the appear on the command line. This means
+   calling '$_progname -e FOO=123 --env-file /path/to/default/name_values -e FOO=bar' will set FOO to equal 'bar'
+ 
+Options:
+   None or one of (if not set, read stdin):
+      -t, --text TEMPLATE_TEXT : the input string. Else read from stdin
+      -i, --input  PATH        : path to the input file. Else read from stdin
+      -d, --directory PATH     : path to the directory to search for templates (*.$_extension). Else read from stdin. If an output 
+                                 directory is set (via -o), the output file is the relative path from the scan directory appended to
+                                 the output directory (outputdir/relative_input_path), minus the template extension.
+  -o, --output PATH            : the output file or directory. Else write to stdout
+  -s, --silent                 : if a token in the template does not exist silently ignore. Default false.
+  -r, --recursive              : if the directory input is selected, recursively search the directory.
+  --ext,--extension            : if the directory input is selected, the template file extension. Default is 'template'
+  --dummy                      : show what would have been done, don't actually do it. Only makes sense if the output file is provided.
+  -v, --verbose                : enable verbose logging. Print to stdout what is happening
+  -e, --env VARX=VALX          : set an environment variable. The name will be uppercased. Can declare multiple times
+  --env-file PATH              : read the envionment variables from the given name/value file (NAME=VALUE). Empty lines and those
+                                 starting with the comment char '#' are ignored. Variables are case sensitive. 
+                                 
+                                 Fails if set and no file exists unless the PATH starts with a '?' as in --env-file ?/path/to/defaults.
+                                 This is useful if using a staggered approach of defaults,system defaults,app specific.
+
+                                 Can declare multiple times
+  -x,--expand-vars             : If enabled, environment variable values are also interpolated. E.g if 'alice like ${likes}' and 
+                                'LIKES=$FRUIT' and 'FRUIT=apples' then will be interplated as 'alice likes apples'. Else it would
+                                 end up as 
+  -h, --help                   : print this help
+Examples:
+  $_progname -i /path/to/my/file -o /ouput/to/file -e USERNAME=alice -e BAR=something
+  echo 'name is \${USERNAME}' | $_progname -o /ouput/to/file
+  echo 'name is \${USERNAME}' | $_progname 
+  echo 'name is \${  USERNAME  }' | $_progname 
+  echo 'name is \${FOO}' | $_progname -e foo=bar    
+  $_progname -e foo=bar -s -t 'it is \\\${BAR}' 
+EOF
+exit -1
+}
+
+do_invoke(){
+    if [ ! -z "$_scan_directory" ]; then
+        pushd "$_scan_directory"
+            log_v "scanning '$_scan_directory' for template files ending in '.$_extension'"
+            # where we will put converted files
+            if [ ! -z "$_output_file" ]; then
+                [ -f "$_output_file" ] && fail "output '$_output_file' must be a directory or not set"
+                dest_prefix="$_output_file"
+            else
+                dest_prefix=""
+            fi
+            files=`find . -type f -name \\*.$_extension`
+            if [ -z "$files" ]; then
+                log_v "no template files found"
+                exit 0
+            fi
+        popd
+        for file in $files; do
+            # todo:strip start and end
+            log_v "interpolating '$file'"
+            src=`cat "$_scan_directory/$file"`
+            if [ -z "$dest_prefix" ];then #output to stdout
+                do_interpolate "$src"
+            else # output to dest dir
+                outfile=`echo $file | sed 's|./||' | sed "s|\.$_extension\$||"`
+                outfile="$dest_prefix/$outfile"                    
+                log_v "output file: '$outfile'"
+                do_interpolate "$src" "$outfile"
+            fi
+        done
+    else
+        # get template source        
+        if [ -z "$_template_src" ]; then #no template provided via stdin
+            if [ -z "$_template_path" ]; then #read from stdin
+                log_v "reading from stdin"
+                _template_src=`cat`
+            else
+                log_v "reading from $_template_path"
+                _template_src=`cat "$_template_path"`       
+            fi
+        fi
+        # figure out how to output result and interpolate
+        if [ ! -z "$_output_file" ]; then # output file specified
+            do_interpolate "$_template_src" "$_output_file"                
+        else
+            do_interpolate "$_template_src"
+        fi        
+    fi
+}
+
+do_interpolate(){
+    src="$1"
+    dest="$2" # if not set use stdout
+
+    # extract all the variables from the template
+    tokens=$(echo "$src" | grep -o '\${\s*[a-zA-Z0-9_.-]*\s*}' | sed -e 's|${\s*||g' -e 's|\s*}||g' | sort -u )
+    log_v "found tokens:$tokens"
+    # build up sed expression to replace args with values in template
+    sed_args=()
+    for token in $tokens;do
+        #dynamically get env variable
+        val=""
+        tok=$token
+        while :; do
+            eval val=\${$tok}
+            if [ "$val" == "" ]; then
+                if [ $_fail_on_missing == 1 ]; then
+                    log "no environment variable '$tok'"
+                    exit -1
+                else
+                    val="\${$tok}" #read env variable with this name
+                fi
+            elif [[ "$val" =~ ^\$ ]] && [ $_expand_vars -eq 1 ]; then # points to another env variable
+                log_v "expanding $tok=$val"
+                tok="${val:1}"
+            else
+                break;
+            fi
+        done
+        log_v "replacing token '$token' ==> '$val'"
+        sed_args+=(-e"s|\\\${\s*$token\s*}|$val|g")
+    done
+    # replace tokens
+    if [ ${#sed_args[@]} -gt 0 ]; then
+        out=`echo "$src" | sed ${sed_args[@]}`        
+    else #no tokens found
+        out="$src"
+    fi
+    # figure out how to output result
+    if [ ! -z "$dest" ]; then # output file specified
+        if [ $_dummy_run -eq 1 ]; then # show what we would have done
+           log "would set $dest to:$out"
+        else
+            if [ -f "$dest" ]; then
+                log_v "output to '$dest'"
+                echo "$out" > "$dest"
+            else # file doesn't exist, create it
+                d=`dirname "$dest"`
+                log_v "make output dir $d"
+                mkdir -p "$d"
+                echo "$out" > "$dest"
+            fi
+        fi
+    else
+        log_v "output to stdout"
+        echo "$out"
+    fi
+    
+}
+
+resolve_token(){
+    token="$1"
+    #dynamically get env variable
+    eval val=\${$token}
+    if [ "$val" == "" ]; then
+        if [ $_fail_on_missing == 1 ]; then
+            log "no environment variable '$token'"
+            exit -1
+        else
+            val="\${$token}" #read env variable with this name
+        fi
+    elif [[ "$val" =~ ^\$ ]]; then # points to another env variable
+        log_v "expanding $val"
+        val=resolve_token "${val:1}"
+        log_v "expanded to $val"
+    fi
+    echo -n "$val"
+}
+
+pushd(){
+    builtin pushd "${1}" > /dev/null
+}
+
+popd(){
+    builtin popd > /dev/null
+}
+
+log(){
+    echo "${_progname}: $1"
+}
+
+# verbose logging
+log_v(){
+    if [ $_verbose -gt 0 ]; then
+        echo "${_progname}: $1"
+    fi
+}
+
+fail(){
+    if [ ! -z "$1" ]; then
+         echo "${_progname}: $1" 1>&2;
+    fi
+    echo "${_progname}: Try '$_progname --help' for more info" 1>&2;
+    exit -1
+}
+
+# ensure no other inputs set
+check_no_input(){
+    if [ ! -z "$_template_src" ] || [ ! -z "$_template_path" ] || [ ! -z "$_scan_directory" ] ; then
+        fail "Invalid inputs. Only one of -t, -i, -d allowed"
+    fi
+}
+
+
+while [ $# -gt 0 ] #do while we have arguments
+do
+    arg="$1"
+    case "$arg" in
+        #extract variable assignment. Expect '-e VAR=VAL' on command line
+        --env|-e) 
+            pair="$2"        
+            name=`echo $pair | sed 's/\(.*\)=.*/\1/'`
+            val=`echo $pair | sed 's/.*=\(.*\)/\1/'`
+            log_v "set env var '${name^^}' ==> '$val'"
+            declare ${name^^}=$val
+            shift
+            ;;
+        --env-file)
+            env_file="$2"
+            env_file_fail=1
+            if [[ "$env_file" =~ ^\?.* ]]; then #starts with a '?' meaning optional
+                env_file_fail=0
+                env_file="${env_file:1}"
+                log_v "$env_file is optional"
+            fi
+            if [ -f "$env_file" ]; then
+                log_v "reading environment vars file $env_file"
+                while read line; do
+                    # ignore comment lines and empty ones                
+                    if [[ ! "$line" =~ ^\s*# ]] && [[ ! "$line" =~ ^\s*$ ]]; then 
+                        log_v "export $line"
+                        export "$line"
+                    fi
+                done < "$env_file"
+            else
+                log_v "no file $env_file"
+                [ $env_file_fail -eq 1 ] && fail "no environment variables file $env_file"     
+            fi
+            shift
+            ;;
+        --text|-t)
+            check_no_input
+            _template_src="$2"
+            shift
+            ;;
+        --input|-i)
+            check_no_input
+            _template_path="$2"
+            if [ ! -f "$_template_path" ]; then
+                fail "no input file '$_template_path'"
+            fi
+            shift
+            ;;
+        --directory|-d)
+            check_no_input
+            _scan_directory="$2"
+            if [ ! -d "$_scan_directory" ]; then
+                fail "no directory '$_scan_directory'"
+            fi
+            shift
+            ;;
+        --output|-o)
+            _output_file="$2"
+            shift
+            ;;
+        --silent|-s)
+            _fail_on_missing=0
+            ;;
+        --dummy_run)
+            _dummy_run=1
+            ;;
+        --extension|--ext)
+            _extension="$2"
+            shift
+            ;;
+        --recursive|-r)
+            _recursive=1
+            ;;
+        --verbose|-v)
+            _verbose=1
+            log_v "enabled verbose logging"
+            ;;
+        --expand-vars|-x)
+            _expand_vars=1
+            ;;
+        --help|-h)
+            usage
+            ;;
+        -*)
+            fail "unknown option '$arg'"
+            ;;
+        *)
+            _template_src="$arg"
+            ;;
+    esac
+    shift #next arg
+done
+
+
+do_invoke
+
