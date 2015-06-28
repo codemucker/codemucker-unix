@@ -1,0 +1,352 @@
+#!/bin/bash
+#
+# original from https://gist.github.com/mikeflynn/4278796
+#
+# Modified by bert
+# Update the hosts file
+#
+
+set -e
+
+_progname=`basename "$0"`
+_progpath="$0"
+
+_logging_on=1
+
+HOSTSFILE="/etc/hosts"
+BAKFILE="$HOSTSFILE.bak"
+DOMAINREGEX="^[a-zA-Z0-9]{1}[a-zA-Z0-9\.\-]+$"
+IPREGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
+URLREGEX="^https?:\/\/[a-zA-Z0-9]{1}[a-zA-Z0-9\/\.\-]+$"
+
+_backed_up=0
+
+usage()
+{
+cat<<EOF
+Usage: ${_progname} [GLOBAL-OPTIONS] COMMAND [COMMAND-OPTIONS]
+
+Manage the /etc/hosts fle programmatically
+
+Changes are backed up to /etc/hosts.bak (or path/to/hosts.bak if a custom file specified)
+
+Commands:
+    add [hostname] [ip]
+    remove [hostname]       : remove the given hosts entry
+    update [hostname] [ip]  : update the hosts file with the given name and ip, or add it if it doesn't exist
+    show [hostname]         : show the host entries for the given hostname
+    ip [hostname]           : show the host entry ip for the given hostname or empty if not found
+    list                    : list the contents of the hosts file, emoving newlines and comments
+    rollback                : reverts the last change)
+    import [file or url] [--append] : replaces or appends the host file with the new one
+Global Options:
+    --help,-h               : print this help
+    --quiet,-q              : don't log
+    --hostfile,-f [PATH]    : the hosts file (default is /etc/hosts)         
+EOF
+}
+
+log(){
+    if [ $_logging_on == 1 ]; then
+        echo "${_progname}: $1"
+    fi
+}
+
+fail(){
+    echo "${_progname}: failed: $1"
+    local code=$2
+    if [ -z "$code" ]; then
+        echo "run '${_progname} -h' for usage"
+        exit -1
+    elif [ $code == 0 ] || [ $code == -1 ]; then
+        exit $code 
+    else
+        echo "run '${_progname} -h' for usage"
+        exit $code
+    fi
+}
+
+backup()
+{
+    if [ $_backed_up != 1 ]; then
+        cat "$HOSTSFILE" > "$BAKFILE"
+        log "backup created at $BAKFILE";
+	    _backed_up=1    
+    fi
+}
+
+check_write()
+{
+	# Check for root user
+	if [ ! -w "${HOSTSFILE}" ]; then
+        fail "no write access to '${HOSTSFILE}'. Try running as root" 192
+	fi
+}
+
+_remove(){
+    local host=$1
+    
+    # Do we have enough arguments?
+    if [ ! $# == 1 ]; then
+        fail "missing arguments: ${_progname} remove [host]" 192
+    fi
+
+    local ip=(ip $host)
+    if [ -z "$ip" ]; then
+        log "host '$host' was not found in the hosts file '$HOSTSFILE'" 0
+    else
+        check_write
+        backup
+        # deal with cases where hostname on it's own, or in a line with others (latter currently removes entire line)
+        cat $HOSTSFILE | sed -e "/[[:blank:]]$host[[:space:]]/ d" -e "/[[:blank:]]$host$/ d" > tmp && mv tmp $HOSTSFILE
+        log "'$host' entry removed."
+    fi
+}
+
+_add(){
+    local host=$1
+    local ip=$2
+
+    # Do we have enough arguments?
+    if [ ! $# == 2 ]; then
+	    fail "missing arguments: ${_progname} add [host] [ip]" 192
+    fi
+    
+    # Does the host look valid?
+    if [[ ! $host =~ $DOMAINREGEX ]]; then
+	    fail "invalid hostname: '$host'" 192
+    fi
+
+    # Does the IP look valid?
+    if [[ ! $ip =~ $IPREGEX ]]; then
+	    fail "invalid IP address: '$ip'" 192
+    fi
+
+    # Check to see if the host is already in the file
+    local ip_current=$(_ip $host)
+    if [ ! -z "$ip_current" ]; then
+        log "host '$host' is already in the hosts file (${HOSTSFILE})." 0
+    else
+        check_write
+        echo -e "$ip\t$host" >> $HOSTSFILE
+        log "added '$host'"
+    fi
+}
+
+_show(){
+    local host=$1
+    # Do we have enough arguments?
+    if [ ! $# == 1 ]; then
+	    fail "missing arguments: ${_progname} show [host]" 192
+    fi
+    local ip=$(_ip $host)
+    if [ ! -z "$ip" ];then      	
+        cat $HOSTSFILE | grep $host
+	else
+	    log "host '$host' was not found in the host file '${HOSTSFILE}'."
+    fi
+}
+
+_ip(){
+    local host=$1
+    # Do we have enough arguments?
+    if [ ! $# == 1 ]; then
+	    fail "missing arguments: ${_progname} ip [host]" 192
+    fi
+    cat "$HOSTSFILE" | sed 's|#.*||' | grep -e "[[:blank:]]${host}[[:space:]]" -e "[[:blank:]]${host}\$" | cut -f1   
+}
+
+
+_update(){
+    local host=$1
+    local ip=$2
+
+    # Do we have enough arguments?
+    if [ ! $# == 2 ]; then
+	    fail "missing arguments: ${_progname} update [host] [ip]" 192
+    fi
+
+    check_write
+
+    # Does the IP look valid?
+    if [[ ! $ip =~ $IPREGEX ]]; then
+	    fail "Invalid IP address: '$ip'" 192
+    fi
+
+    # Does the host look valid?
+    if [[ ! $host =~ $DOMAINREGEX ]]; then
+	    echo "invalid hostname: '$host'" 192
+    fi
+
+    backup
+    _remove $host
+    _add $host $ip
+    log "updated '$host' entry to '$ip'"
+}
+
+_import(){
+    local f="$1"
+    local flag="$2"
+
+    TEMPFILE="./hostsimport.$(date +%s).tmp"
+    APPEND=0
+
+    # Do we have enough arguments?
+    if [ ! $# -gt 0 ]; then
+	    fail "missing arguments: ${_progname} import [file] {--append}" 192
+    fi
+
+    check_write
+
+    if [ ! -z $flag ] && [ $flag == "--append" ]; then
+		APPEND=1
+    fi
+
+    # Check the file type and fetch it if needed.
+
+    if [[ $f =~ $URLREGEX ]]
+	    then
+		    echo "curl -s -o $TEMPFILE $f"
+	    else
+		    TEMPFILE=$f
+    fi
+
+    if [ -f $TEMPFILE ]; 
+	    then
+		    backup
+
+		    IMPORTPREFIX="\n\n## IMPORTED FROM: $f\n\n";
+
+		    if [ $APPEND == 0 ]
+			    then
+				    echo -e "$(head -n 11 $HOSTSFILE)$(echo $IMPORTPREFIX)$(cat $TEMPFILE)" > $HOSTSFILE
+				    log "'$f' has been imported in to '$HOSTSFILE'."; 
+			    else
+				    echo -e "$IMPORTPREFIX" >> "$HOSTSFILE"
+				    cat "$TEMPFILE" >> "$HOSTSFILE"
+				    log "'$f' has been appended on to '$HOSTSFILE'."; 
+		    fi
+	    else
+		    fail "invalid import file '$f', does not exist"
+    fi
+
+
+}
+
+_export(){
+    local f="$1"
+    # Do we have enough arguments?
+    if [ ! $# == 1 ]; then
+	    fail "missing arguments: ${_progname} export [outfile]" 192
+    fi
+
+    check_write
+
+    cat "$HOSTSFILE" > "$f"
+
+    log "current $HOSTFILE saved to '$f'"
+}
+
+_rollback(){
+    check_write
+
+    if [ -f $BAKFILE ]
+	    then
+            log "rolling back ${HOSTSFILE} from ${BAKFILE} "
+		    cat "$BAKFILE" > "$HOSTSFILE"
+		    rm "$BAKFILE"
+		    log "rollback complete."
+	    else
+		    fail "no backup file found!" -1
+    fi
+}
+
+_list(){
+    echo "#== from $HOSTSFILE =="
+	cat "$HOSTSFILE" | sed 's|#.*||' | grep -v -e '^\s*$'
+
+}
+
+# Check that we're in a BASH shell
+if test -z "$BASH" ; then
+  fail "must be run in the BASH shell... Aborting."
+  exit 192
+fi
+
+_run(){
+    case "$1" in 
+    add)
+        _add "${@:2}"
+	    ;;
+    show)
+        _show "${@:2}"
+	    ;;
+    ip)
+        _ip "${@:2}"
+	    ;;
+    remove)
+        _remove "${@:2}"
+	    ;;
+    update)
+	    _update "${@:2}"
+	    ;;
+    import)
+        _import "${@:2}"
+	    ;;
+    export)
+	    _export "${@:2}"
+	    ;;
+    rollback)
+	    _rollback "${@:2}"
+	    ;;
+    list)   
+        _list "${@:2}"
+        ;;
+    *)
+	    fail "unknown command '${1}'. Run '${_progname} -h' for usage." -1
+	    ;;
+    esac
+}
+
+_has_run=0
+while [ $# -gt 0 ] #do while we have arguments
+do
+    arg="$1"
+    case "$arg" in
+        --help|-h)
+    	    usage
+            exit 192
+            break
+            ;;
+        --hostfile|-f)
+            file="$2"
+            if [ ! -f "$file" ]; then
+                fail "no hosts file '${file}'"
+                exit 192
+            fi
+            HOSTSFILE="$file"
+            BAKFILE="$file.bak"
+            log "using ${HOSTSFILE}"
+            shift
+            ;;
+        --quiet|-q)
+            _logging_on=0
+            ;;
+        -*)
+            fail "unknown option '$arg'" 192
+            break
+            ;;
+        *)
+            _run "$@"
+            _has_run=1
+            break
+            ;;
+    esac
+    shift #next arg
+done
+if [ $_has_run == 0 ]; then
+     fail "Missing command. Run '${_progname} -h' for usage." -1
+else
+    exit 0    
+fi
+

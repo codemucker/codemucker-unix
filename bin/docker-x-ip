@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# show the docker ip for the given container
+
+_progname=`basename "$0"`
+case "$1" in
+	--help|-h)
+		cat<<EOF
+Usage: ${_progname} OPTIONS
+
+wrapper around 'docker inspect' to display the ip of the given container
+
+Options:
+  ID_OR_NAME 	: is either a container name or id. Passed to docker
+  --help,-h 	: display this help
+EOF
+		exit -1
+		;;
+	"")
+		echo "$_progname : need to supply a container id or name. Call '${_progname} --help' for options"
+		exit -1		
+		;;
+	*)
+		docker inspect --format '{{ .NetworkSettings.IPAddress }}' "$@"
+		;;
+esac
+
+

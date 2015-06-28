@@ -1,0 +1,263 @@
+#!/bin/bash
+
+#
+# Wrapper around docker. Allows pretty much the same arguments to be passed for all operations (run/stop)
+# and this will figure out what to do with it
+#
+
+#set -e
+
+OPTIND=1
+
+LEV_DEBUG=0
+LEV_INFO=1
+LEV_ERR=2
+
+_progname=`basename "$0"`
+_x11_enabled=0
+_media_enabled=0
+_attach_enabled=0
+_clean_enabled=0
+_update_hosts_enabled=0
+_log_level=$LEV_INFO #0=verbose,1=info,2=err
+_quiet_enabled=0
+_docker_log_enabled=0
+_container_name=
+_host_names=()
+MEDIA_DIR=$HOME/media
+
+_check_name(){
+    if [ -z "$_container_name" ]; then
+        fail "no docker container name provided. Pass one in with --name <name>"    
+        exit -1
+    fi
+}
+
+cmd_stop(){
+    docker stop $_container_name
+}
+
+cmd_run_or_start(){
+    # see http://olivier.barais.fr/blog/posts/2014.08.26/Eclipse_in_docker_container.html
+    # http://stackoverflow.com/questions/25281992/alternatives-to-ssh-x11-forwarding-for-docker-containers
+
+    _check_name
+    
+    name="$_container_name"
+
+    log_v "run or start container '$name'"
+        
+    [ ! $_attach_enabled ] && log_v "to attach to running container run 'docker start -i $name' or 'docker exec -i -t $name bash'"
+
+    exists=`docker inspect "$name" 2>/dev/null | grep -F "$name"`
+    if [ ! -z "$exists" ] && [ $_clean_enabled -eq 1 ] ; then
+        log_v "removing existing container $name"
+        docker rm -f $name
+        exists=""
+    fi
+    if [ -z "$exists" ]; then
+        log_v "creating new container '$name'"
+        run_args=()
+        run_args+=(--name "$name")
+        #[ $_verbose_enabled -eq 1 ] && run_args+=(--verbose)
+        [ $_media_enabled -eq 1 ] && log_v "sharing media with container" && run_args+=(-v "$MEDIA_DIR:/root/media:ro")  
+        if [ $_x11_enabled -eq 1 ]; then
+            log_v "enabling x11"
+            #-v $HOME/.Xauthority:/root/.Xauthority:ro              
+            #xhost +si:localuser:$USER    
+            xhost +local:$name
+            run_args+=(-v "/tmp/.X11-unix:/tmp/.X11-unix:ro")
+            run_args+=(-e "DISPLAY=unix$DISPLAY")
+        fi
+        # add user args
+        while [ $# -gt 0 ] #do while we have arguments
+        do
+            run_args+=("$1")
+            shift
+        done
+        log_v "invoking 'docker run ${run_args[*]}'" 
+        docker run "${run_args[@]}"
+    else 
+        log_v "invoking 'docker start $name'" 
+        docker start $name
+    fi
+
+    if [ $_update_hosts_enabled -eq 1 ]; then
+        ip=`docker-x-ip $name`
+        path=`locate hosts-config`
+        if [ ! -f "$path" ]; then
+            fail "couldn't find location of 'hosts-config'. Tried '$path'"
+        fi    
+        for host in "${_host_names[@]}"; do
+            ip_current=$(hosts-config ip $host)
+            if [ "$ip_current" == "$ip" ]; then
+                log "ip already set to $ip"
+            else            
+                if [ $_log_level -ge $LEV_INFO ]; then
+                    update_hosts_cmd="$path --quiet update $host $ip"
+                else
+                    update_hosts_cmd="$path update $host $ip"
+                fi        
+                log "setting '$ip $host' in /etc/hosts"
+                log "need to run sudo to update hosts file. Running '$update_hosts_cmd'"
+                sudo $update_hosts_cmd
+            fi
+        done
+    fi
+
+    if [ $_docker_log_enabled -eq 1 ]; then
+        log "running docker logs on '$name'"
+        docker logs $name
+    fi
+
+    if [ $_attach_enabled -eq 1 ]; then
+        log "attaching to container '$name' with bash terminal"
+        docker exec -i -t $name bash
+    fi
+
+}
+
+cmd_clean_up(){
+    # remove stopped containers unless they contain the name 'data'    
+    docker rm `docker ps --no-trunc -a | cut -d ' ' -f1-4 | grep -v data | cut -d ' ' -f1`
+    
+    # remove images going nowhere
+    docker images -q --filter "dangling=true" | xargs docker rmi
+}
+
+cmd_remove(){
+    _check_name
+
+    name=$_container_name
+    if [[ "$name" == *"data"* ]]; then
+        read -p "are you sure you want to remove container '$name'? it appears to be a data container! [yN]:" yn
+        case "$yn" in
+            yes|y|Y)
+                log "removing what appears to be a data container"
+            ;;            
+            *)
+                fail "user aborted remove"
+            ;; 
+        esac
+    fi
+    docker rm -f $name
+}
+
+usage(){
+cat <<EOF
+Usage: $_progname COMMAND [OPTIONS] [DOCKER-OPTIONS]
+Description:
+   Thin wrapper around docker to run/start containers
+
+   Non $_progname options are passed to docker as they are
+Commands:
+    run         : run or start the container. Non ${_progname} options are passed directly to 'docker run' (not 'docker start') as is. Requires '--name <name>' 
+    remove      : remove the named docker container. Requires '--name <name>'
+    clean       : remove stopped and dangling containers
+    help        : print this help
+Options:
+    --name,-n           : [Required] name of the container. Passed to docker
+    --x11               : enable X11 support. Share the display. Note that the running program will have access to all keystrokes and mouse events
+    --xmedia            : mount your media directory
+    --xattach           : after starting attach to the running container
+    --xremove           : remove the existing container first if it exists
+    --xlog              : run 'docker logs' on the container after starting
+    --xupdatehosts [HOSTNAME] : update the hosts file with the ip of the container and the given HOSTNAME 
+    --xverbose          : enable verbose logging of $_progname
+    --xquiet            : minimal logging of $_progname, only log errors
+Examples:
+
+    xdocker run --xremove --xupdatehosts
+EOF
+}
+
+log(){
+    [ $_log_level -le $LEV_INFO ] && echo "$_progname: $1"
+}
+
+log_v(){
+    [ $_log_level -le $LEV_DEBUG ] && log "$1"
+}
+
+fail(){
+    log "error! $1"
+    log "run '$_progname help' for usage"
+    exit -1
+}
+
+docker_args=()
+_cmd=""
+while [ $# -gt 0 ] #do while we have arguments
+do
+    arg="$1"
+    if [ -z $_cmd ]; then
+        _cmd="$arg"
+    else
+        case "$arg" in
+            #extract variable assignment. Expect '-e VAR=VAL' on command line
+             --name|-n)
+                _container_name="$2"
+                shift;
+                ;;
+            --x11) 
+                _x11_enabled=1
+                ;;
+            --xmedia)
+                _media_enabled=1
+                ;;
+            --xattach)
+                _attach_enabled=1
+                ;;
+            --xremove)
+                _clean_enabled=1
+                ;;
+            --xverbose)
+                _log_level=$LEV_DEBUG
+                ;;
+            --xlog)
+                _docker_log_enabled=1
+                ;;
+            --xquiet)
+                _log_level=$LEV_ERR
+                ;;
+            --xupdatehosts)
+                _update_hosts_enabled=1
+                host="$2"
+                if [ -z "$host" ]; then
+                    fail "need to supply a hostname with --xupdatehosts [HOST]"
+                fi
+                _host_names+=($host)
+                shift
+                ;;
+            --x*|-x*)
+                fail "unknown ${_progname} option '${arg}'"
+                ;;
+            *)
+                docker_args+=("$arg")
+                ;;
+        esac
+    fi
+    shift #next arg
+done
+
+case "$_cmd" in
+    run)
+        cmd_run_or_start "${docker_args[@]}"
+        ;;   
+    remove)
+        cmd_remove "${docker_args[@]}"
+        ;;    
+    stop)
+        cmd_stop
+        ;;
+    clean)
+        cmd_clean_up
+        ;;
+    help)
+        usage
+        ;;
+    *)
+        fail "unknown command '$_cmd'"
+    ;;
+esac
+
